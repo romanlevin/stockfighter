@@ -1,10 +1,20 @@
 #!/usr/bin/env python
-import requests
 import os
-import time
-import pprint
+import asyncio
+import aiohttp
+import json
+
 
 BASE_URL = 'https://api.stockfighter.io/ob/api'
+
+
+async def handle_response_error(response):
+    if response.status >= 400:
+        raise Exception('HTTP Error: %d' % response.status)
+    body = await response.json()
+    if body.get('ok') is False:
+        raise Exception('API Error: %s' % body.get('error') or 'unspecified')
+    return body
 
 
 class API:
@@ -17,29 +27,21 @@ class API:
     directions = {'buy', 'sell'}
     order_types = {'market', 'limit', 'fill-or-kill', 'immediate-or-cancel'}
 
-    class StockFighterAuth(requests.auth.AuthBase):
-        def __init__(self, api_key):
-            self.api_key = api_key
-
-        def __call__(self, r):
-            r.headers['X-Starfighter-Authorization'] = self.api_key
-            return r
-
     def __init__(self, api_key=None, account=None, venue=None, stock=None):
         api_key = api_key or os.getenv('apikey')
         if not api_key:
             raise ValueError('No API key set')
 
-        auth = self.StockFighterAuth(api_key)
-        self.session = requests.Session()
-        self.session.auth = auth
+        self.session = aiohttp.ClientSession(
+            headers={'content-type': 'application/json',
+                     'X-Starfighter-Authorization': api_key})
 
         # Default values
         self.account = account or os.getenv('account')
         self.venue = venue or os.getenv('venue')
         self.stock = stock or os.getenv('stock')
 
-    def order(self, direction, shares, price, order_type, account=None, venue=None, stock=None):
+    async def order(self, direction, shares, price, order_type, account=None, venue=None, stock=None):
         assert direction in self.directions, '`direction` must be either \'buy\' or \'sell\''
         assert order_type in self.order_types, '`order_type` must be one of %r' % self.order_types
         order = {
@@ -51,58 +53,46 @@ class API:
             'orderType': order_type,
             'price': price,
             }
-        response = self.session.post(
-                self.orders_url.format(**order),
-                json=order)
-        response.raise_for_status()
-        body = response.json()
-        if body.get('ok') is False:
-            pprint.pprint(response.request.body)
-            pprint.pprint(response.request.headers)
-            raise Exception(body.get('error') or response)
-        return response.json()
+        async with self.session.post(self.orders_url.format(**order), data=json.dumps(order)) as response:
+            return await handle_response_error(response)
 
-    def buy(self, *args, **kwargs):
-        return self.order('buy', *args, **kwargs)
+    async def buy(self, *args, **kwargs):
+        return await self.order('buy', *args, **kwargs)
 
-    def sell(self, *args, **kwargs):
-        return self.order('sell', *args, **kwargs)
+    async def sell(self, *args, **kwargs):
+        return await self.order('sell', *args, **kwargs)
 
-    def time_bounded_order(self, *args, timeout=0.5, **kwargs):
-        order = self.order(*args, **kwargs)
+    async def time_bounded_order(self, *args, timeout=0.5, **kwargs):
+        order = await self.order(*args, **kwargs)
         # pprint.pprint(order)
-        time.sleep(timeout)
-        return self.cancel_order(order['id'], venue=kwargs.get('venue'), stock=kwargs.get('stock'))
+        await asyncio.sleep(timeout)
+        return await self.cancel_order(order['id'], venue=kwargs.get('venue'), stock=kwargs.get('stock'))
 
-    def quote(self, venue=None, stock=None):
+    async def quote(self, venue=None, stock=None):
         order = {
             'venue': venue or self.venue,
-            'symbol': stock or self.stock
+            'symbol': stock or self.stock,
             }
-        response = self.session.get(self.quote_url.format(**order))
-        response.raise_for_status()
-        # pprint.pprint(response.json())
-        return response.json()
+        async with self.session.get(self.quote_url.format(**order)) as response:
+            return await handle_response_error(response)
 
-    def order_status(self, order_id, venue=None, stock=None):
+    async def order_status(self, order_id, venue=None, stock=None):
         order = {
             'venue': venue or self.venue,
             'symbol': stock or self.stock,
             'id': order_id,
             }
-        response = self.sessions.get(self.order_url.format(**order))
-        response.raise_for_status()
-        return response.json()
+        async with self.sessions.get(self.order_url.format(**order)) as response:
+            return await handle_response_error(response)
 
-    def cancel_order(self, order_id, venue=None, stock=None):
+    async def cancel_order(self, order_id, venue=None, stock=None):
         order = {
             'venue': venue or self.venue,
             'symbol': stock or self.stock,
             'id': order_id
             }
-        response = self.session.delete(self.order_url.format(**order))
-        response.raise_for_status()
-        return response.json()
+        async with self.session.delete(self.order_url.format(**order)) as response:
+            return await handle_response_error(response)
 
 
 def parse():
@@ -117,8 +107,7 @@ def parse():
     return parser.parse_args()
 
 
-def main():
-    args = parse()
+async def keep_buying(args):
     api = API(api_key=args.apikey, venue=args.venue, account=args.account, stock=args.stock)
     shares_to_buy = args.to_buy
     shares_bought = 0
@@ -126,27 +115,34 @@ def main():
     if args.target:
         first_ask = int(args.target / 0.95)
     ask = 0
-    while shares_bought < shares_to_buy:
-        print(
-                'first_ask:', first_ask, 'last_ask:', ask, 'waiting_for:',
-                first_ask * 0.97, 'shares_bought:', shares_bought, end='\r')
-        quote = api.quote()
-        try:
-            ask = quote['ask']
-            ask_size = quote['askSize']
-        except KeyError:
-            continue
-        first_ask = first_ask or ask
-        if ask > first_ask * 0.95:
-            time.sleep(1.2)
-            continue
-        bid_size = min(shares_to_buy - shares_bought, ask_size)
-        order = api.time_bounded_order(direction='buy', shares=bid_size, order_type='limit', price=ask)
-        # pprint.pprint(order)
-        filled = order['totalFilled']
-        shares_bought += filled
-        # pprint.pprint(order)
-        print('Shares bought:', shares_bought)
+    with api.session:
+        while shares_bought < shares_to_buy:
+            print(
+                    'first_ask:', first_ask, 'last_ask:', ask, 'waiting_for:',
+                    first_ask * 0.97, 'shares_bought:', shares_bought, end='\r')
+            quote = await api.quote()
+            try:
+                ask = quote['ask']
+                ask_size = quote['askSize']
+            except KeyError:
+                continue
+            first_ask = first_ask or ask
+            if ask > first_ask * 0.95:
+                await asyncio.sleep(1.2)
+                continue
+            bid_size = min(shares_to_buy - shares_bought, ask_size)
+            order = await api.time_bounded_order(direction='buy', shares=bid_size, order_type='limit', price=ask)
+            # pprint.pprint(order)
+            filled = order['totalFilled']
+            shares_bought += filled
+            # pprint.pprint(order)
+            print('Shares bought:', shares_bought)
+
+
+def main():
+    args = parse()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(keep_buying(args))
 
 
 if __name__ == '__main__':
