@@ -1,20 +1,41 @@
 #!/usr/bin/env python
+import time
 import os
 import asyncio
 import aiohttp
 import json
+import websockets
 
 
 BASE_URL = 'https://api.stockfighter.io/ob/api'
+WEBSOCKET = 'wss://api.stockfighter.io/ob/api/ws/{account}/venues/{venue}/tickertape/stocks/{stock}'
+THRESHOLD = 0.95
 
 
-async def handle_response_error(response):
+async def unwrap_response(response):
     if response.status >= 400:
         raise Exception('HTTP Error: %d' % response.status)
     body = await response.json()
     if body.get('ok') is False:
         raise Exception('API Error: %s' % body.get('error') or 'unspecified')
     return body
+
+
+async def quote_listener(args, quote):
+    url = WEBSOCKET.format(**vars(args))
+    try:
+        async with websockets.connect(url) as socket:
+            while True:
+                try:
+                    message = json.loads(await socket.recv())
+                except GeneratorExit:
+                    break
+                if 'quote' in message:
+                    quote.update(message['quote'])
+    except websockets.exceptions.ConnectionClosed:
+        # create a new connection
+        loop = asyncio.get_event_loop()
+        loop.create_task(quote_listener(args, quote))
 
 
 class API:
@@ -54,7 +75,7 @@ class API:
             'price': price,
             }
         async with self.session.post(self.orders_url.format(**order), data=json.dumps(order)) as response:
-            return await handle_response_error(response)
+            return await unwrap_response(response)
 
     async def buy(self, *args, **kwargs):
         return await self.order('buy', *args, **kwargs)
@@ -64,7 +85,6 @@ class API:
 
     async def time_bounded_order(self, *args, timeout=0.5, **kwargs):
         order = await self.order(*args, **kwargs)
-        # pprint.pprint(order)
         await asyncio.sleep(timeout)
         return await self.cancel_order(order['id'], venue=kwargs.get('venue'), stock=kwargs.get('stock'))
 
@@ -74,7 +94,7 @@ class API:
             'symbol': stock or self.stock,
             }
         async with self.session.get(self.quote_url.format(**order)) as response:
-            return await handle_response_error(response)
+            return await unwrap_response(response)
 
     async def order_status(self, order_id, venue=None, stock=None):
         order = {
@@ -83,7 +103,7 @@ class API:
             'id': order_id,
             }
         async with self.sessions.get(self.order_url.format(**order)) as response:
-            return await handle_response_error(response)
+            return await unwrap_response(response)
 
     async def cancel_order(self, order_id, venue=None, stock=None):
         order = {
@@ -92,7 +112,7 @@ class API:
             'id': order_id
             }
         async with self.session.delete(self.order_url.format(**order)) as response:
-            return await handle_response_error(response)
+            return await unwrap_response(response)
 
 
 def parse():
@@ -102,47 +122,68 @@ def parse():
     parser.add_argument('-v', '--venue', help='The stock exchange')
     parser.add_argument('-a', '--account', help='The account')
     parser.add_argument('-s', '--stock', help='The stock in question')
-    parser.add_argument('-t', '--target', help='The stock in question', type=int)
+    parser.add_argument('-t', '--target', help='The stock in question', type=int, default=0)
     parser.add_argument('to_buy', help='Amount of shares to buy', type=int)
     return parser.parse_args()
 
 
-async def keep_buying(args):
-    api = API(api_key=args.apikey, venue=args.venue, account=args.account, stock=args.stock)
-    shares_to_buy = args.to_buy
+async def keep_buying(quote, apikey=None, target=0, venue=None, account=None, stock=None, to_buy=None):
+    """
+    Perform a block buy of a stock.
+
+    Quote is updated in a different task by a websocket.
+    """
+    assert to_buy
+    api = API(api_key=apikey, venue=venue, account=account, stock=stock)
+    shares_to_buy = to_buy
     shares_bought = 0
-    first_ask = 0
-    if args.target:
-        first_ask = int(args.target / 0.95)
+    # buy when ask is below this
+    target = target
     ask = 0
+    # last - last time target was adjusted
+    last = time.time()
     with api.session:
         while shares_bought < shares_to_buy:
-            print(
-                    'first_ask:', first_ask, 'last_ask:', ask, 'waiting_for:',
-                    first_ask * 0.97, 'shares_bought:', shares_bought, end='\r')
-            quote = await api.quote()
+            # Throttle orders
+            await asyncio.sleep(1.0)
+            print('target:', target, 'ask:', ask, 'shares_bought:', shares_bought, end='\r')
+            # check the latest quote for this stock
             try:
                 ask = quote['ask']
                 ask_size = quote['askSize']
             except KeyError:
                 continue
-            first_ask = first_ask or ask
-            if ask > first_ask * 0.95:
-                await asyncio.sleep(1.2)
+            # initialize target to first ask if not set
+            target = target or ask * THRESHOLD
+            # is the ask too high?
+            if ask > target:
+                # if we didn't buy any shares for a while, raise target
+                now = time.time()
+                if now - last > 10:
+                    target *= 1.01
+                    last = now
+                continue
+            if not ask_size > 0:
                 continue
             bid_size = min(shares_to_buy - shares_bought, ask_size)
             order = await api.time_bounded_order(direction='buy', shares=bid_size, order_type='limit', price=ask)
-            # pprint.pprint(order)
             filled = order['totalFilled']
             shares_bought += filled
-            # pprint.pprint(order)
-            print('Shares bought:', shares_bought)
+            if filled:
+                # in case price will continue going down, lower target
+                target *= 0.99
+            last = time.time()
 
 
 def main():
     args = parse()
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(keep_buying(args))
+    quote = {}
+    try:
+        loop.create_task(quote_listener(args, quote))
+        loop.run_until_complete(keep_buying(quote=quote, **vars(args)))
+    finally:
+        loop.close()
 
 
 if __name__ == '__main__':
