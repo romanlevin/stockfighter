@@ -4,10 +4,12 @@ from bs4 import BeautifulSoup
 import logging
 import json
 import asyncio
+import websockets
 
 client_logger = logging.getLogger('aiohttp.client')
 
 BASE_URL = 'https://api.stockfighter.io/ob/api'
+WEBSOCKET = 'wss://api.stockfighter.io/ob/api/ws/{account}/venues/{venue}/tickertape/stocks/{stock}'
 
 
 class HTTPError(Exception):
@@ -17,6 +19,9 @@ class HTTPError(Exception):
 class APIError(HTTPError):
     pass
 
+
+class WebsocketConnectionClosed(websockets.exceptions.ConnectionClosed):
+    pass
 
 async def unwrap_response(response):
     if response.status >= 400:
@@ -178,3 +183,22 @@ class API:
             }
         async with self.session.delete(self.order_url.format(**order)) as response:
             return await unwrap_response(response)
+
+    class WebsocketManager:
+        def __init__(self, url):
+            self.url = url
+            self.socket = None
+
+        async def __aenter__(self):
+            return await self()
+
+        async def __aexit__(self, *args):
+            await self.socket.close()
+
+        async def __call__(self):
+            self.socket = await websockets.connect(self.url)
+            return self.socket
+
+    def stock_tickertape(self, account, venue, stock):
+        url = WEBSOCKET.format(account=account, venue=venue, stock=stock)
+        return self.WebsocketManager(url)

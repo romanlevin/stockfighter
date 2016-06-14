@@ -2,13 +2,11 @@
 import time
 import asyncio
 import json
-import websockets
 import logging
 import re
 
-from wrappers import API, Web, APIError
+from wrappers import API, Web, APIError, WebsocketConnectionClosed
 
-WEBSOCKET = 'wss://api.stockfighter.io/ob/api/ws/{account}/venues/{venue}/tickertape/stocks/{stock}'
 THRESHOLD = 0.93
 
 client_logger = logging.getLogger('aiohttp.client')
@@ -141,11 +139,10 @@ async def keep_buying(to_buy=100000):
     ask = 0
     quote = {}
     state = State(instance_id, shares_to_buy=to_buy)
-    ws_url = WEBSOCKET.format(account=account, venue=venue, stock=stock)
     with API(api_key=api_key, venue=venue, account=account, stock=stock) as api, web as web:
         while state.need_more_shares:
             try:
-                async with websockets.connect(ws_url) as tickertape:
+                async with api.stock_tickertape(account, venue, stock) as tickertape:
                     while state.need_more_shares:
                         tickertape_message = json.loads(await tickertape.recv())
                         # Filter repeat tickertape messages
@@ -169,7 +166,7 @@ async def keep_buying(to_buy=100000):
                             continue
                         bid_size = state.bid_size(ask_size)
                         loop.create_task(buy_and_update(bid_size, ask, state, api, web))
-            except websockets.exceptions.ConnectionClosed:
+            except WebsocketConnectionClosed:
                 client_logger.exception('WebSocket closed. Restarting it...')
                 try:
                     client_logger.exception(await web.instance(instance_id))
