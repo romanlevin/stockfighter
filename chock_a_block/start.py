@@ -9,7 +9,7 @@ import re
 from wrappers import API, Web, APIError
 
 WEBSOCKET = 'wss://api.stockfighter.io/ob/api/ws/{account}/venues/{venue}/tickertape/stocks/{stock}'
-THRESHOLD = 0.95
+THRESHOLD = 0.93
 
 client_logger = logging.getLogger('aiohttp.client')
 client_logger.addHandler(logging.StreamHandler())
