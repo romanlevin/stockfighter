@@ -1,3 +1,4 @@
 .python-version
 *.swp
 session.json
+__pycache__
